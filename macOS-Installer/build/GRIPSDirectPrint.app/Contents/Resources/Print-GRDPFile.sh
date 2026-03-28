@@ -50,7 +50,7 @@ if [[ -z "$CONFIG_FILE" ]]; then
 fi
 
 if [[ -z "$USER_CONFIG_FILE" ]]; then
-    USER_CONFIG_FILE="$SCRIPT_DIR/userconfig-macos.json"
+    USER_CONFIG_FILE="$HOME/Library/Application Support/GRIPSDirectPrint/userconfig-macos.json"
 fi
 
 # Global variables
@@ -77,13 +77,24 @@ get_config() {
     CONFIG[ReleaseCheckDelay]=$(parse_json "$CONFIG_FILE" '.ReleaseCheckDelay')
     CONFIG[TranscriptMaxAgeDays]=$(parse_json "$CONFIG_FILE" '.TranscriptMaxAgeDays')
     CONFIG[UsePrereleaseVersion]=$(parse_json "$CONFIG_FILE" '.UsePrereleaseVersion')
-    CONFIG[Delay]=$(parse_json "$CONFIG_FILE" '.Delay')
     
     # Merge user config if it exists
     if [[ -f "$USER_CONFIG_FILE" ]]; then
         # Override with user config values
         local user_version=$(parse_json "$USER_CONFIG_FILE" '.Version')
         [[ -n "$user_version" && "$user_version" != "null" ]] && CONFIG[Version]="$user_version"
+        
+        local user_prerelease=$(parse_json "$USER_CONFIG_FILE" '.UsePrereleaseVersion')
+        [[ -n "$user_prerelease" && "$user_prerelease" != "null" ]] && CONFIG[UsePrereleaseVersion]="$user_prerelease"
+        
+        local user_api_url=$(parse_json "$USER_CONFIG_FILE" '.ReleaseApiUrl')
+        [[ -n "$user_api_url" && "$user_api_url" != "null" ]] && CONFIG[ReleaseApiUrl]="$user_api_url"
+        
+        local user_check_delay=$(parse_json "$USER_CONFIG_FILE" '.ReleaseCheckDelay')
+        [[ -n "$user_check_delay" && "$user_check_delay" != "null" ]] && CONFIG[ReleaseCheckDelay]="$user_check_delay"
+        
+        local user_max_age=$(parse_json "$USER_CONFIG_FILE" '.TranscriptMaxAgeDays')
+        [[ -n "$user_max_age" && "$user_max_age" != "null" ]] && CONFIG[TranscriptMaxAgeDays]="$user_max_age"
     fi
 }
 
@@ -100,46 +111,267 @@ update_check() {
     local release_api_url="${CONFIG[ReleaseApiUrl]}"
     local use_prerelease="${CONFIG[UsePrereleaseVersion]}"
     
+    echo "[DEBUG] Release API URL: $release_api_url"
+    echo "[DEBUG] Use prerelease: $use_prerelease"
+    echo "[DEBUG] Current version: ${CONFIG[Version]}"
+    
     if [[ "$use_prerelease" == "true" ]]; then
         echo "Checking for latest release (including prereleases)..."
-        # Get all releases
-        local all_releases=$(curl -s "${release_api_url/\/latest/}" 2>/dev/null)
-        local latest_release=$(echo "$all_releases" | "$JQ" -r '.[0]' 2>/dev/null)
+        local api_url="${release_api_url/\/latest/}"
+        echo "[DEBUG] Fetching all releases from: $api_url"
+        
+        # Get all releases with detailed error handling
+        local http_code=$(curl -s -w "%{http_code}" -o /tmp/grdp_api_response_$$.json "$api_url" 2>&1)
+        local curl_exit_code=$?
+        
+        echo "[DEBUG] HTTP response code: $http_code"
+        echo "[DEBUG] curl exit code: $curl_exit_code"
+        
+        if [[ $curl_exit_code -ne 0 ]]; then
+            echo "[ERROR] curl failed with exit code $curl_exit_code"
+            echo "Unable to check for updates (network error)"
+            rm -f /tmp/grdp_api_response_$$.json
+            return
+        fi
+        
+        if [[ "$http_code" != "200" ]]; then
+            echo "[ERROR] API returned HTTP $http_code"
+            if [[ -f /tmp/grdp_api_response_$$.json ]]; then
+                echo "[DEBUG] Response body (first 500 chars):"
+                head -c 500 /tmp/grdp_api_response_$$.json
+                echo ""
+            fi
+            echo "Unable to check for updates (API error)"
+            rm -f /tmp/grdp_api_response_$$.json
+            return
+        fi
+        
+        local all_releases=$(cat /tmp/grdp_api_response_$$.json)
+        
+        echo "[DEBUG] Response length: ${#all_releases} characters"
+        echo "[DEBUG] First 200 chars of response: ${all_releases:0:200}"
+        
+        # Sanitize control characters that might be in release notes
+        # GitHub API sometimes returns unescaped control characters in release body text
+        echo "[DEBUG] Sanitizing response to remove problematic control characters..."
+        
+        # Save original response for debugging
+        local debug_dir="$(cache_dir)/debug"
+        mkdir -p "$debug_dir"
+        echo "$all_releases" > "$debug_dir/api_response_original.json"
+        echo "[DEBUG] Original response saved to: $debug_dir/api_response_original.json"
+        
+        # Use perl to escape literal control characters in JSON strings before jq processes it
+        # This handles cases where GitHub API returns unescaped newlines/CRs in string values
+        echo "$all_releases" | perl -0777 -pe '
+            # Escape literal control characters within JSON string values
+            s/"([^"]*)"/ 
+                my $str = $1;
+                $str =~ s#\\r#\\\\r#g;   # Escape any existing backslash-r
+                $str =~ s#\\n#\\\\n#g;   # Escape any existing backslash-n
+                $str =~ s#\r#\\n#g;      # Convert literal CR to escaped newline
+                $str =~ s#\n#\\n#g;      # Convert literal LF to escaped newline
+                $str =~ s#\t#\\t#g;      # Escape literal tabs
+                qq{"$str"}
+            /ge;
+        ' > "$debug_dir/api_response_sanitized.json"
+        echo "[DEBUG] Sanitized response saved to: $debug_dir/api_response_sanitized.json"
+        
+        # Test if response is valid JSON array
+        local latest_release
+        latest_release=$(cat "$debug_dir/api_response_sanitized.json" | "$JQ" '.[0]' 2>/tmp/grdp_jq_error_$$.txt)
+        local jq_exit_code=$?
+        
+        if [[ $jq_exit_code -ne 0 ]]; then
+            echo "[ERROR] jq parsing failed with exit code $jq_exit_code"
+            if [[ -f /tmp/grdp_jq_error_$$.txt ]]; then
+                echo "[DEBUG] jq error output:"
+                cat /tmp/grdp_jq_error_$$.txt
+            fi
+            echo "[DEBUG] Attempting to parse as single object instead of array..."
+            # Maybe it's a single release object, not an array
+            latest_release=$(cat "$debug_dir/api_response_sanitized.json" | "$JQ" '.' 2>/tmp/grdp_jq_error2_$$.txt)
+            jq_exit_code=$?
+            if [[ $jq_exit_code -ne 0 ]]; then
+                echo "[ERROR] jq parsing still failed"
+                cat /tmp/grdp_jq_error2_$$.txt 2>/dev/null
+                echo "[ERROR] Debug files saved in: $debug_dir"
+                echo "[ERROR] Check api_response_original.json and api_response_sanitized.json"
+                rm -f /tmp/grdp_api_response_$$.json /tmp/grdp_jq_error*.txt
+                echo "Unable to check for updates (JSON parsing error)"
+                return
+            fi
+        fi
+        
+        rm -f /tmp/grdp_api_response_$$.json /tmp/grdp_api_sanitized_$$.json /tmp/grdp_jq_error*.txt
+        
+        echo "[DEBUG] Successfully parsed release data"
     else
         echo "Checking for latest stable release only..."
-        local latest_release=$(curl -s "$release_api_url" 2>/dev/null)
+        echo "[DEBUG] Fetching latest release from: $release_api_url"
+        
+        # Get latest release with detailed error handling
+        local http_code=$(curl -s -w "%{http_code}" -o /tmp/grdp_api_response_$$.json "$release_api_url" 2>&1)
+        local curl_exit_code=$?
+        
+        echo "[DEBUG] HTTP response code: $http_code"
+        echo "[DEBUG] curl exit code: $curl_exit_code"
+        
+        if [[ $curl_exit_code -ne 0 ]]; then
+            echo "[ERROR] curl failed with exit code $curl_exit_code"
+            echo "Unable to check for updates (network error)"
+            rm -f /tmp/grdp_api_response_$$.json
+            return
+        fi
+        
+        if [[ "$http_code" != "200" ]]; then
+            echo "[ERROR] API returned HTTP $http_code"
+            if [[ -f /tmp/grdp_api_response_$$.json ]]; then
+                echo "[DEBUG] Response body (first 500 chars):"
+                head -c 500 /tmp/grdp_api_response_$$.json
+                echo ""
+            fi
+            echo "Unable to check for updates (API error)"
+            rm -f /tmp/grdp_api_response_$$.json
+            return
+        fi
+        
+        local latest_release=$(cat /tmp/grdp_api_response_$$.json)
+        
+        echo "[DEBUG] Response length: ${#latest_release} characters"
+        echo "[DEBUG] First 200 chars of response: ${latest_release:0:200}"
+        
+        # Sanitize control characters that might be in release notes
+        echo "[DEBUG] Sanitizing response to remove problematic control characters..."
+        
+        # Save original response for debugging
+        local debug_dir="$(cache_dir)/debug"
+        mkdir -p "$debug_dir"
+        echo "$latest_release" > "$debug_dir/api_response_original.json"
+        echo "[DEBUG] Original response saved to: $debug_dir/api_response_original.json"
+        
+        # Use perl to escape literal control characters in JSON strings before jq processes it
+        # This handles cases where GitHub API returns unescaped newlines/CRs in string values
+        echo "$latest_release" | perl -0777 -pe '
+            # Escape literal control characters within JSON string values
+            s/"([^"]*)"/ 
+                my $str = $1;
+                $str =~ s#\\r#\\\\r#g;   # Escape any existing backslash-r
+                $str =~ s#\\n#\\\\n#g;   # Escape any existing backslash-n
+                $str =~ s#\r#\\n#g;      # Convert literal CR to escaped newline
+                $str =~ s#\n#\\n#g;      # Convert literal LF to escaped newline
+                $str =~ s#\t#\\t#g;      # Escape literal tabs
+                qq{"$str"}
+            /ge;
+        ' > "$debug_dir/api_response_sanitized.json"
+        echo "[DEBUG] Sanitized response saved to: $debug_dir/api_response_sanitized.json"
+        
+        # Verify it's valid JSON
+        cat "$debug_dir/api_response_sanitized.json" | "$JQ" -r '.' >/dev/null 2>/tmp/grdp_jq_error_$$.txt
+        local jq_validation_exit=$?
+        if [[ $jq_validation_exit -ne 0 ]]; then
+            echo "[ERROR] Response is not valid JSON"
+            cat /tmp/grdp_jq_error_$$.txt 2>/dev/null
+            echo "[ERROR] Debug files saved in: $debug_dir"
+            echo "[ERROR] Check api_response_original.json and api_response_sanitized.json"
+            rm -f /tmp/grdp_api_response_$$.json /tmp/grdp_jq_error*.txt
+            echo "Unable to check for updates (JSON parsing error)"
+            return
+        fi
+        
+        # Use sanitized version for further processing
+        latest_release=$(cat "$debug_dir/api_response_sanitized.json")
+        
+        rm -f /tmp/grdp_api_response_$$.json /tmp/grdp_jq_error*.txt
     fi
     
-    local release_version=$(echo "$latest_release" | "$JQ" -r '.tag_name' 2>/dev/null | sed 's/^v//')
+    # Extract the tag_name from the release JSON
+    echo "[DEBUG] Extracting version tag from release data..."
+    local release_version
+    release_version=$(printf '%s\n' "$latest_release" | "$JQ" -r '.tag_name' 2>/tmp/grdp_jq_error_$$.txt)
+    local jq_tag_exit_code=$?
+    
+    if [[ $jq_tag_exit_code -ne 0 ]]; then
+        echo "[ERROR] Failed to extract tag_name from release data"
+        if [[ -f /tmp/grdp_jq_error_$$.txt ]]; then
+            echo "[DEBUG] jq error:"
+            cat /tmp/grdp_jq_error_$$.txt
+        fi
+        rm -f /tmp/grdp_jq_error*.txt
+        echo "Unable to check for updates (JSON parsing error)"
+        return
+    fi
+    
+    # Remove 'v' prefix if present
+    release_version="${release_version#v}"
+    
     local current_version="${CONFIG[Version]}"
+    
+    echo "[DEBUG] Extracted release version: '$release_version'"
+    echo "[DEBUG] jq tag extraction exit code: $jq_tag_exit_code"
     
     # Check if we got a valid version
     if [[ -z "$release_version" || "$release_version" == "null" ]]; then
+        echo "[ERROR] Failed to extract valid version from API response"
+        rm -f /tmp/grdp_jq_error*.txt
         echo "Unable to check for updates (API error or network issue)"
         return
     fi
     
+    rm -f /tmp/grdp_jq_error*.txt
     # Simple version comparison
-    if [[ "$(printf '%s\n' "$release_version" "$current_version" | sort -V | tail -n1)" != "$current_version" ]]; then
+    echo "[DEBUG] Comparing versions: release=$release_version current=$current_version"
+    local version_comparison=$(printf '%s\n' "$release_version" "$current_version" | sort -V | tail -n1)
+    echo "[DEBUG] Version comparison result: $version_comparison (if != current_version, update is available)"
+    
+    if [[ "$version_comparison" != "$current_version" ]]; then
         echo "Update available: $release_version (current: $current_version)"
         
-        local temp_zip="/tmp/grdp_update_$$.zip"
-        local temp_extract="/tmp/grdp_extract_$$"
-        local download_url=$(echo "$latest_release" | "$JQ" -r '.zipball_url' 2>/dev/null)
+        # Look for .pkg asset in release
+        echo "[DEBUG] Searching for .pkg asset in release..."
+        local pkg_download_url=$(printf '%s\n' "$latest_release" | "$JQ" -r '.assets[] | select(.name | test("GRIPSDirectPrint.*\\.pkg$"; "i")) | .browser_download_url' 2>&1 | head -n1)
+        local jq_assets_exit_code=${PIPESTATUS[1]}
         
-        # Download and extract
-        curl -sL "$download_url" -o "$temp_zip"
-        mkdir -p "$temp_extract"
-        unzip -q "$temp_zip" -d "$temp_extract"
+        echo "[DEBUG] jq assets extraction exit code: $jq_assets_exit_code"
+        echo "[DEBUG] Package download URL: '$pkg_download_url'"
         
-        # Find the extracted folder
-        local extracted_folder=$(find "$temp_extract" -mindepth 1 -maxdepth 1 -type d | head -n1)
+        if [[ -z "$pkg_download_url" || "$pkg_download_url" == "null" ]]; then
+            echo "[ERROR] Could not find .pkg installer in release assets"
+            echo "[DEBUG] Available assets:"
+            printf '%s\n' "$latest_release" | "$JQ" -r '.assets[] | .name' 2>&1 || echo "[ERROR] Failed to list assets"
+            return
+        fi
         
-        # Create update signal file
-        local update_signal_file="$SCRIPT_DIR/update_ready.txt"
-        echo "$extracted_folder" > "$update_signal_file"
+        local temp_pkg="/tmp/grdp_update_$$.pkg"
         
-        rm -f "$temp_zip"
+        echo "Downloading installer from: $pkg_download_url"
+        echo "[DEBUG] Downloading to: $temp_pkg"
+        
+        local download_http_code=$(curl -sL -w "%{http_code}" -o "$temp_pkg" "$pkg_download_url" 2>&1)
+        local download_exit_code=$?
+        
+        echo "[DEBUG] Download HTTP code: $download_http_code"
+        echo "[DEBUG] Download curl exit code: $download_exit_code"
+        
+        if [[ ! -f "$temp_pkg" ]]; then
+            echo "[ERROR] Failed to download installer - file not created"
+            return
+        fi
+        
+        local file_size=$(stat -f%z "$temp_pkg" 2>/dev/null || echo "0")
+        echo "[DEBUG] Downloaded file size: $file_size bytes"
+        
+        if [[ "$file_size" -lt 1000 ]]; then
+            echo "[ERROR] Downloaded file is too small (likely an error page)"
+            rm -f "$temp_pkg"
+            return
+        fi
+        
+        # Create update signal file with path to installer
+        local update_signal_file="$(cache_dir)/update_ready.txt"
+        echo "$temp_pkg" > "$update_signal_file"
+        
+        echo "Update downloaded successfully. Will install on next run."
     else
         echo "No update required. Current version ($current_version) is up to date."
     fi
@@ -147,44 +379,50 @@ update_check() {
 
 # Function to perform the update
 update_release() {
-    local update_signal_file="$SCRIPT_DIR/update_ready.txt"
+    local update_signal_file="$(cache_dir)/update_ready.txt"
     
     if [[ ! -f "$update_signal_file" ]]; then
         echo "Error: Update signal file not found: $update_signal_file"
         return
     fi
     
-    local extracted_folder=$(cat "$update_signal_file")
+    local pkg_file=$(cat "$update_signal_file")
     
-    if [[ -z "$extracted_folder" ]]; then
-        echo "Error: Update signal file is empty"
+    if [[ -z "$pkg_file" || ! -f "$pkg_file" ]]; then
+        echo "Error: Installer package not found: $pkg_file"
         rm -f "$update_signal_file"
         return
     fi
     
-    echo "$(date '+%Y-%m-%d %H:%M:%S') Updating release from $extracted_folder"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Installing update from $pkg_file"
     
-    # Backup current directory
-    local backup_dir="$SCRIPT_DIR.bak"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') Backup script folder: $backup_dir"
+    # Remove quarantine attribute
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Removing quarantine attribute..."
+    xattr -d com.apple.quarantine "$pkg_file" 2>/dev/null || true
     
-    rm -rf "$backup_dir"
-    cp -R "$SCRIPT_DIR" "$backup_dir"
+    # Install using osascript with admin privileges
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Launching installer (requires administrator password)..."
     
-    # Copy new files
-    echo "$(date '+%Y-%m-%d %H:%M:%S') Copying new script folder from $extracted_folder to $SCRIPT_DIR"
-    cp -R "$extracted_folder/"* "$SCRIPT_DIR/"
+    osascript -e "do shell script \"installer -pkg '${pkg_file}' -target /\" with administrator privileges with prompt \"GRIPS Direct Print wants to install a new version.\"" 2>&1
+    local install_result=$?
     
-    rm -f "$update_signal_file"
-    
-    get_script_version
-    echo "$(date '+%Y-%m-%d %H:%M:%S') Script updated to version ${CONFIG[Version]}."
+    if [[ $install_result -eq 0 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') Update installed successfully."
+        rm -f "$update_signal_file"
+        rm -f "$pkg_file"
+        get_script_version
+        echo "$(date '+%Y-%m-%d %H:%M:%S') Script updated to version ${CONFIG[Version]}."
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') Error: Installation failed or was cancelled by user."
+        rm -f "$update_signal_file"
+        rm -f "$pkg_file"
+        return 1
+    fi
 }
 
 # Function to get last update check time
 get_last_update_check_time() {
-    local cache_dir="$HOME/Library/Caches/com.grips.directprint"
-    local last_check_file="$cache_dir/last_update_check.txt"
+    local last_check_file="$(cache_dir)/last_update_check.txt"
     
     if [[ -f "$last_check_file" ]]; then
         cat "$last_check_file"
@@ -195,29 +433,8 @@ get_last_update_check_time() {
 
 # Function to set last update check time
 set_last_update_check_time() {
-    local cache_dir="$HOME/Library/Caches/com.grips.directprint"
-    mkdir -p "$cache_dir"
-    local last_check_file="$cache_dir/last_update_check.txt"
+    local last_check_file="$(cache_dir)/last_update_check.txt"
     date +%s > "$last_check_file"
-}
-
-# Function to start transcript logging
-start_transcript() {
-    local transcript_dir="$SCRIPT_DIR/Transcripts"
-    mkdir -p "$transcript_dir"
-    
-    local timestamp=$(date '+%Y%m%d_%H%M%S')
-    local transcript_file="$transcript_dir/Print-GRDPFile_${timestamp}.Transcript.txt"
-    
-    # Start logging
-    #exec > >(tee -a "$transcript_file")
-    #exec 2>&1
-    
-    echo "=== Transcript started at $(date) ==="
-    
-    # Remove old transcripts
-    local max_age_days="${CONFIG[TranscriptMaxAgeDays]:-7}"
-    find "$transcript_dir" -name "Print-GRDPFile_*.Transcript.txt" -mtime +$max_age_days -delete
 }
 
 # Function to get unique filename
@@ -307,20 +524,26 @@ select_alternative_printer() {
         return 1
     fi
     
-    # Create printer list for dialog
-    local printer_list=$(echo "$printers" | tr '\n' ',' | sed 's/,$//')
+    # Convert newline-separated printers to AppleScript list format
+    # Each printer name needs to be quoted and comma-separated
+    local printer_array=()
+    while IFS= read -r printer; do
+        [[ -n "$printer" ]] && printer_array+=("\"$printer\"")
+    done <<< "$printers"
+    
+    local printer_list=$(IFS=','; echo "${printer_array[*]}")
     
     # Show selection dialog
     local selected=$(osascript <<EOF
-tell application "System Events"
-    set printerList to {"$printer_list"}
-    set selectedPrinter to choose from list (paragraphs of printerList) with prompt "Printer '$missing_printer' not found.\\n\\nSelect an alternative printer:" default items {item 1 of (paragraphs of printerList)}
-    if selectedPrinter is false then
-        return ""
-    else
-        return item 1 of selectedPrinter
-    end if
-end tell
+set printerList to {$printer_list}
+set selectedPrinter to choose from list printerList with prompt "Printer '$missing_printer' not found.
+
+Select an alternative printer:" default items {item 1 of printerList}
+if selectedPrinter is false then
+    return ""
+else
+    return item 1 of selectedPrinter
+end if
 EOF
 )
     
@@ -385,13 +608,16 @@ print_pdf_cups() {
     fi
 }
 
+cache_dir() {
+    local dir="$HOME/Library/Caches/com.grips.directprint"
+    mkdir -p "$dir"
+    echo "$dir"
+}
+
 # Main execution
 main() {
     # Load configuration
     get_config
-    
-    # Start transcript
-    start_transcript
     
     echo "Processing file: $INPUT_FILE"
     
@@ -484,12 +710,11 @@ main() {
     fi
     
     # Check for updates
-    local update_signal_file="$SCRIPT_DIR/update_ready.txt"
+    local update_signal_file="$(cache_dir)/update_ready.txt"
     
     if [[ -f "$update_signal_file" ]]; then
         update_release
     else
-        local last_check_file="$SCRIPT_DIR/last_update_check.txt"
         local last_check_time=$(get_last_update_check_time)
         local current_time=$(date +%s)
         local elapsed=$((current_time - last_check_time))
@@ -503,8 +728,6 @@ main() {
             echo "Last update check was $elapsed seconds ago. Skipping update check."
         fi
     fi
-    
-    echo "=== Transcript ended at $(date) ==="
 }
 
 # Run main function
